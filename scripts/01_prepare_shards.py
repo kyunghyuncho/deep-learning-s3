@@ -39,8 +39,14 @@ s3 = boto3.client(
 )
 
 # NOTE: create the bucket "cifar-streaming" in the MinIO UI first, or use s3.create_bucket(Bucket="cifar-streaming")
+import json
 try:
     s3.create_bucket(Bucket="cifar-streaming")
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [{"Sid": "PublicRead", "Effect": "Allow", "Principal": "*", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::cifar-streaming/*"]}]
+    }
+    s3.put_bucket_policy(Bucket="cifar-streaming", Policy=json.dumps(policy))
 except:
     pass
 
