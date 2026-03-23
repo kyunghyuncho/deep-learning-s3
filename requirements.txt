@@ -1,0 +1,9 @@
+boto3
+webdataset
+torch
+torchvision
+pytorch-lightning
+ipywidgets
+matplotlib
+requests
+jupyter
