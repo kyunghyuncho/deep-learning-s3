@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lecture 2: The Ingestion Bottleneck and Streaming</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root {
+    --r-heading-color: #58a6ff;
+    --r-link-color: #79c0ff;
+    --r-main-font-size: 32px;
+  }
+  .reveal h1, .reveal h2 { color: #58a6ff; }
+  .reveal h3 { color: #8b949e; }
+  .reveal .slides section { text-align: left; }
+  .reveal .slides section.center-slide { text-align: center; }
+  .reveal .highlight-box {
+    background: rgba(88,166,255,0.1);
+    border-left: 4px solid #58a6ff;
+    padding: 16px 20px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .reveal .warning-box {
+    background: rgba(210,153,34,0.12);
+    border-left: 4px solid #d29922;
+    padding: 16px 20px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .reveal .eq-box {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    padding: 20px 28px;
+    margin: 20px auto;
+    text-align: center;
+    max-width: 85%;
+  }
+  .reveal table { font-size: 0.7em; margin: 12px auto; }
+  .reveal table th { background: rgba(88,166,255,0.15); }
+  .reveal table td, .reveal table th { padding: 8px 16px; border: 1px solid rgba(255,255,255,0.15); }
+  .reveal code { color: #79c0ff; }
+  .reveal ul { font-size: 0.85em; }
+  .reveal .subtitle { color: #8b949e; font-size: 0.7em; }
+  .reveal .two-col { display: flex; gap: 40px; }
+  .reveal .two-col > div { flex: 1; }
+  .reveal .small { font-size: 0.65em; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ===== TITLE ===== -->
+<section class="center-slide">
+  <h1 style="font-size:1.6em;">Lecture 2</h1>
+  <h2 style="font-size:1.1em;">The Ingestion Bottleneck &amp; Streaming</h2>
+  <p class="subtitle">Big Data</p>
+  <p class="subtitle">Shuffle Buffers, DataLoader Optimization, and Training a Neural Network on a Stream</p>
+</section>
+
+<!-- ===== AGENDA ===== -->
+<section>
+  <h2>Today's Agenda</h2>
+  <ol>
+    <li><strong>The Shuffle Buffer</strong> — Pseudo-random sampling from streams</li>
+    <li><strong>DataLoader Optimization</strong> — The producer-consumer pipeline</li>
+    <li><strong>ResNet Architecture</strong> — Residual connections and gradient flow</li>
+    <li><strong>Training Loop</strong> — Cross-entropy, AdamW, and PyTorch Lightning</li>
+    <li><strong>Hands-On Lab</strong> — Train a model on live MinIO streams</li>
+  </ol>
+  <div class="highlight-box" style="margin-top:16px;">
+    <strong>Recap from Lecture 1:</strong> We serialized CIFAR-10 into 50 WebDataset <code>.tar</code> shards and uploaded them to our local MinIO S3 store.
+  </div>
+</section>
+
+<!-- ===== PART 1: SHUFFLE BUFFER ===== -->
+<section>
+  <h2>1. The Shuffle Problem</h2>
+  <h3>Why Can't We Globally Shuffle?</h3>
+  <p>In Spark, <code>orderBy(rand())</code> shuffles data by materializing it in cluster memory.</p>
+  <p>For a 10TB ImageNet on S3, that requires:</p>
+  <ul>
+    <li>10TB of RAM to hold the data</li>
+    <li>Network transfer of the entire dataset <em>before</em> training begins</li>
+    <li>$\mathcal{O}(D)$ memory complexity where $D$ = dataset size</li>
+  </ul>
+  <div class="warning-box">
+    <strong>Unfeasible at scale.</strong> We need a streaming alternative with $\mathcal{O}(K)$ memory, where $K \ll D$.
+  </div>
+</section>
+
+<section>
+  <h2>Sliding-Window Buffer Shuffle</h2>
+  <h3>The Algorithm</h3>
+  <ol>
+    <li>Fill a buffer with $K$ items from the sequential stream</li>
+    <li>Randomly pop one item → yield it as output</li>
+    <li>Fill the vacated slot with the next stream item</li>
+    <li>Repeat forever</li>
+  </ol>
+  <div class="eq-box">
+    <p><strong>Memory:</strong> $\mathcal{O}(K)$ &nbsp;&nbsp;|&nbsp;&nbsp; <strong>True uniform:</strong> $\mathcal{O}(D)$</p>
+  </div>
+  <div class="highlight-box">
+    <strong>Key insight for SGD:</strong> Stochastic Gradient Descent doesn't need <em>perfect</em> uniform randomness. It only needs consecutive minibatches to be sufficiently <strong>decorrelated</strong>. A buffer of $K \geq 1000$ is typically enough.
+  </div>
+</section>
+
+<section>
+  <h2>Buffer Size Visualization</h2>
+  <h3>Worst-Case Ordered Stream (sorted by class)</h3>
+  <div class="two-col">
+    <div>
+      <h3 style="color:#e74c3c;">K = 1 (no shuffle)</h3>
+      <ul>
+        <li>First 1000 yields: all class 0</li>
+        <li>Next 1000: all class 1</li>
+        <li>Gradients heavily biased</li>
+        <li>❌ Network oscillates wildly</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="color:#2ecc71;">K = 5000</h3>
+      <ul>
+        <li>Classes well-mixed in buffer</li>
+        <li>~100 per class per 1000 yields</li>
+        <li>Gradients represent full distribution</li>
+        <li>✅ Stable convergence</li>
+      </ul>
+    </div>
+  </div>
+  <pre><code class="language-python"># WebDataset implementation:
+dataset = wds.WebDataset(url, shardshuffle=True)  # Inter-shard shuffle
+              .shuffle(1000)  # Intra-shard buffer (K=1000)</code></pre>
+</section>
+
+<!-- ===== PART 2: DATALOADER ===== -->
+<section>
+  <h2>2. The Producer-Consumer Model</h2>
+  <h3>GPU as Consumer, DataLoader as Producer</h3>
+  <p>If the DataLoader can't supply data faster than the GPU processes it, the GPU <strong>idles</strong> — wasting expensive hardware.</p>
+  <table>
+    <tr><th>Hardware</th><th>Cost/Hour</th><th>TFLOPS</th></tr>
+    <tr><td>NVIDIA A100 80GB</td><td>~$3.00</td><td>312 (FP16)</td></tr>
+    <tr><td>NVIDIA H100 80GB</td><td>~$5.00</td><td>990 (FP16)</td></tr>
+    <tr><td>8× H100 Node</td><td>~$40.00</td><td>7,920 (FP16)</td></tr>
+  </table>
+  <p class="small">Every second of GPU idle time due to data starvation is wasted money at scale.</p>
+</section>
+
+<section>
+  <h2>DataLoader Parameters</h2>
+  <table>
+    <tr><th>Parameter</th><th>Purpose</th><th>Typical</th></tr>
+    <tr><td><code>batch_size</code></td><td>Samples per gradient update</td><td>64–1024</td></tr>
+    <tr><td><code>num_workers</code></td><td>Background processes fetching data</td><td>2–8</td></tr>
+    <tr><td><code>pin_memory</code></td><td>Page-locked CPU memory for async GPU transfer</td><td>True (CUDA)</td></tr>
+    <tr><td><code>persistent_workers</code></td><td>Keep workers alive between epochs</td><td>True</td></tr>
+  </table>
+  <pre><code class="language-python">loader = DataLoader(
+    dataset,
+    batch_size=256,      # 256 images per minibatch
+    num_workers=4,       # 4 parallel HTTP fetchers
+    pin_memory=True      # Pre-allocate page-locked memory
+)</code></pre>
+</section>
+
+<section>
+  <h2>Why <code>num_workers &gt; 0</code>?</h2>
+  <h3>Python's GIL Problem</h3>
+  <p>Python's <strong>Global Interpreter Lock (GIL)</strong> prevents true multi-threading for CPU-bound work.</p>
+  <p><code>num_workers</code> spawns separate <strong>processes</strong> (not threads), each independently:</p>
+  <ol>
+    <li>Opens HTTP connections to MinIO</li>
+    <li>Streams and decompresses <code>.tar</code> bytes</li>
+    <li>Decodes images and applies transforms</li>
+    <li>Places results in a shared memory queue</li>
+  </ol>
+  <p>The main process simply <strong>dequeues batches</strong> — achieving true parallelism.</p>
+  <div class="highlight-box">
+    <strong>Finding the sweet spot:</strong> Too few workers → GPU starves. Too many → CPU/memory contention. Profile with the benchmark loop in the notebook!
+  </div>
+</section>
+
+<!-- ===== PART 3: RESNET ===== -->
+<section>
+  <h2>3. The Vanishing Gradient Problem</h2>
+  <p>As networks deepen, gradients are multiplied through many layers during backpropagation:</p>
+  <div class="eq-box">
+    $$\frac{\partial \mathcal{L}}{\partial x_0} = \prod_{i=1}^{L} \frac{\partial x_i}{\partial x_{i-1}} \cdot \frac{\partial \mathcal{L}}{\partial x_L}$$
+  </div>
+  <p>If each layer's Jacobian has spectral norm $&lt; 1$, gradients shrink <strong>exponentially</strong>:</p>
+  <ul>
+    <li>10 layers: gradients ≈ $0.9^{10} = 0.35$</li>
+    <li>50 layers: gradients ≈ $0.9^{50} = 0.005$</li>
+    <li>100 layers: gradients ≈ $0.9^{100} \approx 0$ — <strong>vanished!</strong></li>
+  </ul>
+  <p class="small">Early layers stop learning → deep networks perform worse than shallow ones.</p>
+</section>
+
+<section>
+  <h2>The Residual Solution</h2>
+  <h3>He et al., 2015 — "Deep Residual Learning"</h3>
+  <p>Instead of learning a direct mapping $H(x)$, learn a <strong>perturbation</strong> added to identity:</p>
+  <div class="eq-box">
+    $$y = \mathcal{F}(x, \{W_i\}) + x$$
+  </div>
+  <p>The derivative via chain rule:</p>
+  <div class="eq-box">
+    $$\frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} \left( \frac{\partial \mathcal{F}}{\partial x} + \mathbf{1} \right)$$
+  </div>
+  <div class="highlight-box">
+    The <strong>+1 term</strong> from the identity shortcut guarantees gradients always have a direct highway back through the network, regardless of what $\mathcal{F}$ learns. This enables networks with 1,000+ layers.
+  </div>
+</section>
+
+<section>
+  <h2>Our ResNet9 Architecture</h2>
+  <pre><code class="language-text">Input: (N, 3, 32, 32)
+  ↓ Conv2d(3→64, 3×3, pad=1) + BatchNorm + ReLU
+  ↓   → (N, 64, 32, 32)
+  │
+  ├──→ Conv(64→64) + ReLU + Conv(64→64)  ← F(x)
+  │                                         │
+  └──────── identity shortcut ────────────→(+)
+                                             ↓ ReLU
+  ↓ MaxPool2d(2) → (N, 64, 16, 16)
+  ↓ Reshape     → (N, 16384)
+  ↓ Linear      → (N, 10) class logits</code></pre>
+  <p class="small">Total: ~239K parameters. Small enough to train in a lecture, large enough to demonstrate real learning.</p>
+</section>
+
+<!-- ===== PART 4: TRAINING ===== -->
+<section>
+  <h2>4. Categorical Cross-Entropy Loss</h2>
+  <p>The model outputs <strong>logits</strong> $z \in \mathbb{R}^{C}$. Softmax converts to probabilities:</p>
+  <div class="eq-box">
+    $$\hat{y}_c = \frac{e^{z_c}}{\sum_{j=1}^{C} e^{z_j}}$$
+  </div>
+  <p>Cross-entropy measures the "surprise" of predicted vs. true distribution:</p>
+  <div class="eq-box">
+    $$\mathcal{L} = -\sum_{c=1}^{C} y_c \log(\hat{y}_c) = -\log(\hat{y}_{true})$$
+  </div>
+  <div class="highlight-box">
+    PyTorch's <code>F.cross_entropy</code> uses the <strong>log-sum-exp trick</strong> for numerical stability: $\mathcal{L} = -z_{true} + \log\left(\sum_j e^{z_j}\right)$. Never compute softmax + log separately!
+  </div>
+</section>
+
+<section>
+  <h2>AdamW Optimizer</h2>
+  <h3>Adam + Decoupled Weight Decay</h3>
+  <p>Maintains per-parameter adaptive learning rates using moment estimates:</p>
+  <div class="eq-box">
+    $$m_t = \beta_1 m_{t-1} + (1 - \beta_1)\, g_t \quad \text{(momentum)}$$
+    $$v_t = \beta_2 v_{t-1} + (1 - \beta_2)\, g_t^2 \quad \text{(variance)}$$
+    $$\theta_t = \theta_{t-1} - \eta \left(\frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda\, \theta_{t-1}\right)$$
+  </div>
+  <table>
+    <tr><th>Hyperparameter</th><th>Default</th><th>Role</th></tr>
+    <tr><td>$\eta$ (lr)</td><td>1e-3</td><td>Step size</td></tr>
+    <tr><td>$\beta_1$</td><td>0.9</td><td>Momentum decay</td></tr>
+    <tr><td>$\beta_2$</td><td>0.999</td><td>Variance decay</td></tr>
+    <tr><td>$\lambda$</td><td>0.01</td><td>Weight decay (regularization)</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>PyTorch Lightning</h2>
+  <h3>Separating Engineering from Research</h3>
+  <div class="two-col">
+    <div>
+      <h3 style="color:#e74c3c;">You Write</h3>
+      <ul>
+        <li><code>training_step()</code></li>
+        <li><code>test_step()</code></li>
+        <li><code>configure_optimizers()</code></li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="color:#2ecc71;">Lightning Handles</h3>
+      <ul>
+        <li>Device placement (CPU/GPU/TPU)</li>
+        <li><code>loss.backward()</code></li>
+        <li><code>optimizer.step()</code></li>
+        <li>Gradient clipping</li>
+        <li>Logging &amp; checkpointing</li>
+        <li>Multi-GPU / distributed</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>The Training Step</h2>
+  <pre><code class="language-python">def training_step(self, batch, batch_idx):
+    images, labels = batch
+
+    # WebDataset decodes to (N, H, W, C) — channels last
+    # PyTorch Conv2d expects (N, C, H, W) — channels first
+    images = images.permute(0, 3, 1, 2).contiguous()
+
+    outputs = self(images)                    # Forward pass
+    loss = F.cross_entropy(outputs, labels)   # Compute loss
+
+    preds = torch.argmax(outputs, dim=1)      # Predicted classes
+    acc = (preds == labels).float().mean()     # Accuracy
+
+    self.log('train_loss', loss, prog_bar=True)
+    self.log('train_acc', acc, prog_bar=True)
+    return loss  # Lightning calls .backward() automatically</code></pre>
+</section>
+
+<section>
+  <h2>Data Layout: NHWC vs NCHW</h2>
+  <h3>Why <code>.permute(0, 3, 1, 2).contiguous()</code>?</h3>
+  <div class="two-col">
+    <div>
+      <h3>NHWC (WebDataset)</h3>
+      <p>Batch × Height × Width × <strong>Channels</strong></p>
+      <p><code>(256, 32, 32, 3)</code></p>
+      <p class="small">Standard for image files (PNG, JPEG)</p>
+    </div>
+    <div>
+      <h3>NCHW (PyTorch)</h3>
+      <p>Batch × <strong>Channels</strong> × Height × Width</p>
+      <p><code>(256, 3, 32, 32)</code></p>
+      <p class="small">Optimized for GPU convolution kernels</p>
+    </div>
+  </div>
+  <div class="warning-box" style="margin-top:16px;">
+    <code>.permute()</code> rearranges dimensions <strong>without copying data</strong> (just changes strides). <code>.contiguous()</code> then copies to sequential memory — required for backpropagation through non-contiguous tensors.
+  </div>
+</section>
+
+<!-- ===== RECAP ===== -->
+<section>
+  <h2>Key Takeaways</h2>
+  <ol>
+    <li><strong>Shuffle buffers</strong> provide $\mathcal{O}(K)$ pseudo-random sampling — sufficient for SGD</li>
+    <li><strong>DataLoader workers</strong> bypass the GIL via multiprocessing to saturate GPU throughput</li>
+    <li><strong>Residual connections</strong> solve vanishing gradients via the identity shortcut (+1 in the derivative)</li>
+    <li><strong>Cross-entropy + softmax</strong> are implemented together via log-sum-exp for numerical stability</li>
+    <li><strong>PyTorch Lightning</strong> abstracts away engineering boilerplate (devices, gradients, logging)</li>
+  </ol>
+  <div class="highlight-box" style="margin-top:16px;">
+    <strong>Next lecture:</strong> Distributed paradigms — Parameter Server vs Ring-AllReduce, and why modern GPU clusters are built as toruses.
+  </div>
+</section>
+
+<!-- ===== LAB ===== -->
+<section class="center-slide">
+  <h2>🧪 Hands-On Lab</h2>
+  <p>Open <code>notebooks/Lecture_02_Streaming_and_Ingestion.ipynb</code></p>
+  <ol style="text-align:left; max-width:80%; margin:auto;">
+    <li>Run the <strong>Shuffle Buffer Simulator</strong> — observe K=1 vs K=5000</li>
+    <li>Configure the <strong>DataLoader</strong> and measure throughput</li>
+    <li>Inspect the <strong>ResNet9</strong> architecture and parameter counts</li>
+    <li><strong>Train the model</strong> live on MinIO streams with <code>trainer.fit()</code></li>
+    <li><strong>Evaluate</strong> with <code>trainer.test()</code> and interpret results</li>
+  </ol>
+</section>
+
+</div><!-- /.slides -->
+</div><!-- /.reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/math/math.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: true,
+  transition: 'slide',
+  plugins: [ RevealHighlight, RevealMath.KaTeX ]
+});
+</script>
+</body>
+</html>
