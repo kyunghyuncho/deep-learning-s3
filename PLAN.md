@@ -1,5 +1,5 @@
 # PLAN: Bridging Big Data and Distributed AI Ingestion
-**Target Course:** CSCI-GA.2437 (Big Data)
+**Target Course:** Big Data
 **Focus:** Data formatting, S3-compatible streaming, shuffle buffers, and distributed I/O.
 **Lecture Duration:** 3 x 100-minute sessions.
 
