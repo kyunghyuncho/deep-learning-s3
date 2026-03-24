@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lecture 1: The Storage and Serialization Bridge</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root {
+    --r-heading-color: #58a6ff;
+    --r-link-color: #79c0ff;
+    --r-main-font-size: 32px;
+  }
+  .reveal h1, .reveal h2 { color: #58a6ff; }
+  .reveal h3 { color: #8b949e; }
+  .reveal .slides section { text-align: left; }
+  .reveal .slides section.center-slide { text-align: center; }
+  .reveal .highlight-box {
+    background: rgba(88,166,255,0.1);
+    border-left: 4px solid #58a6ff;
+    padding: 16px 20px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .reveal .warning-box {
+    background: rgba(210,153,34,0.12);
+    border-left: 4px solid #d29922;
+    padding: 16px 20px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .reveal .eq-box {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    padding: 20px 28px;
+    margin: 20px auto;
+    text-align: center;
+    max-width: 85%;
+  }
+  .reveal table { font-size: 0.7em; margin: 12px auto; }
+  .reveal table th { background: rgba(88,166,255,0.15); }
+  .reveal table td, .reveal table th { padding: 8px 16px; border: 1px solid rgba(255,255,255,0.15); }
+  .reveal code { color: #79c0ff; }
+  .reveal ul { font-size: 0.85em; }
+  .reveal .subtitle { color: #8b949e; font-size: 0.7em; }
+  .reveal .two-col { display: flex; gap: 40px; }
+  .reveal .two-col > div { flex: 1; }
+  .reveal .small { font-size: 0.65em; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ===== TITLE ===== -->
+<section class="center-slide">
+  <h1 style="font-size:1.6em;">Lecture 1</h1>
+  <h2 style="font-size:1.1em;">The Storage &amp; Serialization Bridge</h2>
+  <p class="subtitle">CSCI-GA.2437 — Big Data</p>
+  <p class="subtitle">Bridging Spark's HDFS/Parquet Outputs to AI's S3/Sequential-Read Ingestion</p>
+</section>
+
+<!-- ===== AGENDA ===== -->
+<section>
+  <h2>Today's Agenda</h2>
+  <ol>
+    <li><strong>The Small Files Problem</strong> — Why GPUs starve</li>
+    <li><strong>Object Storage Fundamentals</strong> — S3, MinIO, Buckets</li>
+    <li><strong>Data Serialization</strong> — WebDataset &amp; Tar Shards</li>
+    <li><strong>Streaming Pipelines</strong> — From network to GPU, zero disk</li>
+    <li><strong>Hands-On Lab</strong> — Interactive notebook exercises</li>
+  </ol>
+</section>
+
+<!-- ===== PART 1: THE PROBLEM ===== -->
+<section>
+  <h2>1. The Small Files Problem</h2>
+  <h3>The Gap Between Big Data and AI</h3>
+  <p>Spark produces output as <strong>distributed partitions</strong> — millions of small files across HDFS nodes.</p>
+  <p>AI training needs <strong>sequential, high-throughput reads</strong> — GPUs process data orders of magnitude faster than storage can deliver it file-by-file.</p>
+  <div class="warning-box">
+    <strong>Core tension:</strong> Spark optimizes for <em>parallel random access</em>. Deep learning optimizes for <em>sequential streaming</em>.
+  </div>
+</section>
+
+<section>
+  <h2>What Happens Per File Access?</h2>
+  <p>Every individual file request incurs a <strong>seek penalty</strong>:</p>
+  <table>
+    <tr><th>Step</th><th>Overhead</th></tr>
+    <tr><td>DNS Resolution</td><td>~1–50 ms</td></tr>
+    <tr><td>TCP Handshake (SYN/SYN-ACK/ACK)</td><td>~1–10 ms</td></tr>
+    <tr><td>TLS Negotiation (HTTPS)</td><td>~5–30 ms</td></tr>
+    <tr><td>S3 API Auth (AWS Sig V4)</td><td>~5–20 ms</td></tr>
+    <tr><td>Disk/SSD Seek</td><td>~0.1–10 ms</td></tr>
+    <tr><td><strong>Total T<sub>seek</sub></strong></td><td><strong>~12–120 ms</strong></td></tr>
+  </table>
+  <p class="small">These costs are paid <em>per file</em>, regardless of file size.</p>
+</section>
+
+<section>
+  <h2>The I/O Latency Equation</h2>
+  <h3>Baseline: Independent Files</h3>
+  <div class="eq-box">
+    $$T_{total} = N \times \left(T_{seek} + \frac{S_{file}}{B_{network}}\right)$$
+  </div>
+  <p>With CIFAR-10: $N=60{,}000$, $T_{seek}=50\text{ms}$, $S_{file}=3\text{KB}$, $B=1\text{Gbps}$</p>
+  <div class="highlight-box">
+    Seek penalty alone: $60{,}000 \times 0.05\text{s} = \mathbf{3{,}000\text{s}}$ — <strong>50 minutes</strong> of GPU idle time!
+  </div>
+</section>
+
+<section>
+  <h2>The Solution: Contiguous Sharding</h2>
+  <h3>Amortized I/O with Tar Archives</h3>
+  <div class="eq-box">
+    $$T_{total} \approx T_{seek\_archive} + \frac{N \times S_{file}}{B_{network}}$$
+  </div>
+  <p>Pack 1,000 images per <code>.tar</code> shard → only <strong>50 seeks</strong> instead of 60,000.</p>
+  <div class="two-col">
+    <div>
+      <h3>Before (60K files)</h3>
+      <ul>
+        <li>60,000 HTTP roundtrips</li>
+        <li>3,000s seek overhead</li>
+        <li>GPU utilization: ~0%</li>
+      </ul>
+    </div>
+    <div>
+      <h3>After (50 shards)</h3>
+      <ul>
+        <li>50 HTTP connections</li>
+        <li>2.5s seek overhead</li>
+        <li>GPU utilization: ~95%+</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ===== PART 2: OBJECT STORAGE ===== -->
+<section>
+  <h2>2. Object Storage Fundamentals</h2>
+  <h3>Why Not Just Use a Filesystem?</h3>
+  <div class="two-col">
+    <div>
+      <h3>Filesystem (HDFS, ext4)</h3>
+      <ul>
+        <li>Hierarchical directories</li>
+        <li>Mutable files (append, overwrite)</li>
+        <li>POSIX semantics (open/read/seek/close)</li>
+        <li>Scales to ~millions of files</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Object Storage (S3)</h3>
+      <ul>
+        <li>Flat namespace (buckets + keys)</li>
+        <li>Immutable objects (replace only)</li>
+        <li>HTTP API (GET / PUT / DELETE)</li>
+        <li>Scales to <strong>trillions</strong> of objects</li>
+      </ul>
+    </div>
+  </div>
+  <p class="small" style="margin-top:16px;">S3 is the de facto standard for AI training data. AWS, GCP (GCS), Azure (Blob) all expose S3-compatible APIs.</p>
+</section>
+
+<section>
+  <h2>MinIO: S3 on Your Laptop</h2>
+  <p><a href="https://min.io">MinIO</a> is an open-source, S3-compatible object store that runs as a single binary.</p>
+  <div class="highlight-box">
+    <strong>Why MinIO for this course?</strong>
+    <ul>
+      <li>Identical API to AWS S3 — same <code>boto3</code> code works on both</li>
+      <li>Runs locally — no cloud account, no cost, no network dependency</li>
+      <li>Web console at <code>http://127.0.0.1:9000</code></li>
+    </ul>
+  </div>
+  <pre><code class="language-bash"># Start MinIO (our script handles download + launch)
+python scripts/00_start_minio.py</code></pre>
+</section>
+
+<section>
+  <h2>Key S3 Concepts</h2>
+  <table>
+    <tr><th>Concept</th><th>Description</th><th>Analogy</th></tr>
+    <tr><td><strong>Bucket</strong></td><td>Top-level container</td><td>Database schema</td></tr>
+    <tr><td><strong>Object</strong></td><td>A file + metadata</td><td>A row with a blob column</td></tr>
+    <tr><td><strong>Key</strong></td><td>String identifier</td><td>Primary key / file path</td></tr>
+    <tr><td><strong>Pagination</strong></td><td>1,000 objects per list response</td><td>LIMIT/OFFSET in SQL</td></tr>
+    <tr><td><strong>IAM/Credentials</strong></td><td>Access key + secret key</td><td>Username + password</td></tr>
+    <tr><td><strong>Bucket Policy</strong></td><td>JSON access control document</td><td>SQL GRANT statements</td></tr>
+  </table>
+</section>
+
+<!-- ===== PART 3: SERIALIZATION ===== -->
+<section>
+  <h2>3. Data Serialization with WebDataset</h2>
+  <h3>Why <code>.tar</code> and not <code>.zip</code>?</h3>
+  <div class="two-col">
+    <div>
+      <h3>ZIP</h3>
+      <ul>
+        <li>Central directory at end of file</li>
+        <li>Must seek to EOF before reading</li>
+        <li>❌ Not streamable over HTTP</li>
+      </ul>
+    </div>
+    <div>
+      <h3>TAR</h3>
+      <ul>
+        <li>Sequential header + data blocks</li>
+        <li>Read from byte 0, no index needed</li>
+        <li>✅ Perfectly streamable over HTTP</li>
+      </ul>
+    </div>
+  </div>
+  <div class="highlight-box" style="margin-top:16px;">
+    <strong>WebDataset</strong> stores each sample as a group of files sharing a common key:<br>
+    <code>000042.png</code> (image) + <code>000042.cls</code> (label) → one training sample
+  </div>
+</section>
+
+<section>
+  <h2>Shard Generation</h2>
+  <pre><code class="language-python"># scripts/01_prepare_shards.py (simplified)
+import torchvision, webdataset as wds
+
+dataset = torchvision.datasets.CIFAR10(root='./data',
+                                        train=True, download=True)
+
+with wds.ShardWriter("cifar-train-%06d.tar",
+                      maxcount=1000) as sink:
+    for i, (img, label) in enumerate(dataset):
+        sink.write({
+            "__key__": f"{i:06d}",  # Groups related files
+            "png": img,             # Auto-serialized to PNG bytes
+            "cls": label            # Stored as text file
+        })</code></pre>
+  <p class="small">Output: 50 shards × ~3 MB each = 150 MB total (vs. 60,000 individual files)</p>
+</section>
+
+<section>
+  <h2>Uploading Shards to S3</h2>
+  <pre><code class="language-python">import boto3, glob
+
+s3 = boto3.client('s3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='minioadmin',
+    aws_secret_access_key='minioadmin')
+
+# Create bucket + set public-read policy
+s3.create_bucket(Bucket="cifar-streaming")
+
+# Upload each shard as an S3 object
+for f in glob.glob("cifar-train-*.tar"):
+    s3.upload_file(f, "cifar-streaming", f)</code></pre>
+  <div class="highlight-box">
+    <strong>Same code works with AWS S3</strong> — just remove <code>endpoint_url</code> and use real IAM credentials.
+  </div>
+</section>
+
+<!-- ===== PART 4: STREAMING ===== -->
+<section>
+  <h2>4. Streaming Pipeline</h2>
+  <h3>From Network → GPU, Zero Local Disk</h3>
+  <pre><code class="language-python">import webdataset as wds
+
+url = "http://127.0.0.1:9000/cifar-streaming/" \
+      "cifar-train-{000000..000049}.tar"
+
+dataset = (
+    wds.WebDataset(url, shardshuffle=False)
+    .decode("rgb")           # PNG bytes → float32 array
+    .to_tuple("png", "cls")  # Package as (image, label)
+)</code></pre>
+  <p>Each pipeline stage is <strong>lazy</strong> — data flows on-demand as you iterate, never fully materializing in RAM.</p>
+</section>
+
+<section>
+  <h2>The WebDataset Pipeline Stages</h2>
+  <table>
+    <tr><th>Stage</th><th>Input</th><th>Output</th></tr>
+    <tr><td><code>WebDataset(url)</code></td><td>URL pattern</td><td>Raw tar byte streams</td></tr>
+    <tr><td><code>.decode("rgb")</code></td><td>PNG byte buffer</td><td>numpy float32 (H,W,3) [0,1]</td></tr>
+    <tr><td><code>.to_tuple("png","cls")</code></td><td>Dict of decoded fields</td><td>(image_array, label_int) tuples</td></tr>
+    <tr><td><code>.shuffle(K)</code></td><td>Ordered stream</td><td>Pseudo-random stream (buffer K)</td></tr>
+    <tr><td><code>.batched(N)</code></td><td>Individual samples</td><td>Batches of N samples</td></tr>
+  </table>
+  <p class="small">All stages are composable and lazy — no intermediate copies to disk.</p>
+</section>
+
+<section>
+  <h2>Verifying the Stream</h2>
+  <p>We visualize 16 streamed images in a 4×4 grid using matplotlib:</p>
+  <pre><code class="language-python">import matplotlib.pyplot as plt
+
+images, labels = [], []
+for idx, (img, lbl) in enumerate(dataset):
+    images.append(img); labels.append(lbl)
+    if idx == 15: break
+
+fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+for i, ax in enumerate(axes.flat):
+    ax.imshow(images[i])
+    ax.set_title(f"Class: {labels[i]}")
+    ax.axis("off")
+plt.show()</code></pre>
+  <p class="small">Every pixel arrived over HTTP — no local files touched.</p>
+</section>
+
+<!-- ===== RECAP ===== -->
+<section>
+  <h2>Key Takeaways</h2>
+  <ol>
+    <li><strong>Seek time dominates</strong> when reading millions of small files — GPUs idle at 0%</li>
+    <li><strong>Contiguous sharding</strong> (tar archives) amortizes seek cost across thousands of samples</li>
+    <li><strong>Object storage</strong> (S3/MinIO) is the universal API for remote training data</li>
+    <li><strong>WebDataset</strong> streams tar shards over HTTP directly into your training pipeline</li>
+    <li><strong>Lazy pipelines</strong> avoid materializing data on local disk</li>
+  </ol>
+  <div class="highlight-box" style="margin-top:16px;">
+    <strong>Next lecture:</strong> Shuffle buffers, DataLoader optimization, and training a ResNet on the stream.
+  </div>
+</section>
+
+<!-- ===== LAB ===== -->
+<section class="center-slide">
+  <h2>🧪 Hands-On Lab</h2>
+  <p>Open <code>notebooks/Lecture_01_Storage_and_Serialization.ipynb</code></p>
+  <ol style="text-align:left; max-width:80%; margin:auto;">
+    <li>Run the <strong>I/O Latency Simulator</strong> — find the crossover point where sharding stops helping</li>
+    <li>Use <code>boto3</code> to <strong>list your bucket contents</strong></li>
+    <li>Stream images via <strong>WebDataset</strong> and explore them with the interactive slider</li>
+  </ol>
+</section>
+
+</div><!-- /.slides -->
+</div><!-- /.reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/math/math.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: true,
+  transition: 'slide',
+  plugins: [ RevealHighlight, RevealMath.KaTeX ]
+});
+</script>
+</body>
+</html>
