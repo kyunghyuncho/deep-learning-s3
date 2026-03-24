@@ -221,18 +221,17 @@ dataset = wds.WebDataset(url, shardshuffle=True)  # Inter-shard shuffle
 
 <section>
   <h2>Our ResNet9 Architecture</h2>
-  <pre><code class="language-text">Input: (N, 3, 32, 32)
-  ↓ Conv2d(3→64, 3×3, pad=1) + BatchNorm + ReLU
-  ↓   → (N, 64, 32, 32)
-  │
-  ├──→ Conv(64→64) + ReLU + Conv(64→64)  ← F(x)
-  │                                         │
-  └──────── identity shortcut ────────────→(+)
-                                             ↓ ReLU
-  ↓ MaxPool2d(2) → (N, 64, 16, 16)
-  ↓ Reshape     → (N, 16384)
-  ↓ Linear      → (N, 10) class logits</code></pre>
-  <p class="small">Total: ~239K parameters. Small enough to train in a lecture, large enough to demonstrate real learning.</p>
+  <table style="font-size:0.75em; width:90%; margin:0 auto;">
+    <tr><th>Layer</th><th>Operation</th><th>Output Shape</th></tr>
+    <tr><td>Input</td><td>RGB Image</td><td>(N, 3, 32, 32)</td></tr>
+    <tr><td>Conv + BN + ReLU</td><td>Conv2d(3&rarr;64, 3&times;3, pad=1)</td><td>(N, 64, 32, 32)</td></tr>
+    <tr style="background:rgba(46,204,113,0.1);"><td>Residual Block</td><td>Conv(64&rarr;64) + ReLU + Conv(64&rarr;64)</td><td>(N, 64, 32, 32)</td></tr>
+    <tr style="background:rgba(46,204,113,0.1);"><td>Skip Connection</td><td><strong>F(x) + x</strong> then ReLU</td><td>(N, 64, 32, 32)</td></tr>
+    <tr><td>MaxPool</td><td>MaxPool2d(2)</td><td>(N, 64, 16, 16)</td></tr>
+    <tr><td>Flatten</td><td>reshape</td><td>(N, 16384)</td></tr>
+    <tr><td>Classifier</td><td>Linear(16384 &rarr; 10)</td><td>(N, 10)</td></tr>
+  </table>
+  <p class="small">Total: ~239K parameters. Green rows = the residual block where <strong>F(x) + x</strong> enables gradient flow.</p>
 </section>
 
 <!-- ===== PART 4: TRAINING ===== -->
