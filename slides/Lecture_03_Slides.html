@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lecture 3: Distributed Paradigms</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root {
+    --r-heading-color: #58a6ff;
+    --r-link-color: #79c0ff;
+    --r-main-font-size: 28px;
+  }
+  .reveal h1, .reveal h2 { color: #58a6ff; margin-bottom: 0.3em; }
+  .reveal h3 { color: #8b949e; margin-bottom: 0.2em; }
+  .reveal p { margin: 0.3em 0; }
+  .reveal .slides section { text-align: left; }
+  .reveal .slides section.center-slide { text-align: center; }
+  .reveal .highlight-box {
+    background: rgba(88,166,255,0.1);
+    border-left: 4px solid #58a6ff;
+    padding: 10px 16px;
+    margin: 10px 0;
+    border-radius: 4px;
+    font-size: 0.78em;
+  }
+  .reveal .warning-box {
+    background: rgba(210,153,34,0.12);
+    border-left: 4px solid #d29922;
+    padding: 10px 16px;
+    margin: 10px 0;
+    border-radius: 4px;
+    font-size: 0.78em;
+  }
+  .reveal .eq-box {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    padding: 12px 20px;
+    margin: 12px auto;
+    text-align: center;
+    max-width: 85%;
+  }
+  .reveal table { font-size: 0.65em; margin: 8px auto; }
+  .reveal table th { background: rgba(88,166,255,0.15); }
+  .reveal table td, .reveal table th { padding: 6px 12px; border: 1px solid rgba(255,255,255,0.15); }
+  .reveal code { color: #79c0ff; }
+  .reveal ul, .reveal ol { font-size: 0.8em; }
+  .reveal .subtitle { color: #8b949e; font-size: 0.7em; }
+  .reveal .two-col { display: flex; gap: 30px; }
+  .reveal .two-col > div { flex: 1; }
+  .reveal .small { font-size: 0.6em; color: #8b949e; }
+  .reveal pre { margin: 8px 0; font-size: 0.48em; }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ===== TITLE ===== -->
+<section class="center-slide">
+  <h1 style="font-size:1.6em;">Lecture 3</h1>
+  <h2 style="font-size:1.1em;">Distributed Paradigms</h2>
+  <p class="subtitle">Big Data</p>
+  <p class="subtitle">Parameter Servers, Ring-AllReduce, and Why GPU Clusters Are Built as Toruses</p>
+</section>
+
+<!-- ===== AGENDA ===== -->
+<section>
+  <h2>Today's Agenda</h2>
+  <ol>
+    <li><strong>Why Spark Fails</strong> &mdash; The gradient synchronization bottleneck</li>
+    <li><strong>Hardware Primitives</strong> &mdash; PCIe, NVLink, InfiniBand, RDMA</li>
+    <li><strong>Parameter Server</strong> &mdash; Hub-and-spoke aggregation</li>
+    <li><strong>Ring-AllReduce</strong> &mdash; Bandwidth-optimal collective communication</li>
+    <li><strong>Interactive Simulation</strong> &mdash; Scaling and saturation</li>
+  </ol>
+  <div class="highlight-box">
+    <strong>Recap:</strong> In Lecture 2 we trained a ResNet on streamed data from MinIO. Now we ask: <em>what happens when we scale to thousands of GPUs?</em>
+  </div>
+</section>
+
+<!-- ===== PART 1: WHY SPARK FAILS ===== -->
+<section>
+  <h2>1. Why Spark Fails at Deep Learning</h2>
+  <p>Data-parallel training requires every node to exchange <strong>the full model's gradients</strong> after every minibatch (~0.5&ndash;2 seconds).</p>
+  <table>
+    <tr><th>Model</th><th>Parameters</th><th>Gradient Size (FP32)</th></tr>
+    <tr><td>ResNet-50</td><td>25.6M</td><td>97.7 MB</td></tr>
+    <tr><td>GPT-2</td><td>1.5B</td><td>5.7 GB</td></tr>
+    <tr><td>GPT-3</td><td>175B</td><td>700 GB</td></tr>
+    <tr><td>Llama 3 70B</td><td>70B</td><td>280 GB</td></tr>
+  </table>
+  <div class="warning-box">
+    Spark's TCP/IP networking + driver-worker architecture cannot sustain hundreds of GB every 1&ndash;2 seconds.
+  </div>
+</section>
+
+<section>
+  <h2>The Synchronization Pattern</h2>
+  <h3>Data-Parallel Distributed Training</h3>
+  <ol>
+    <li>Each GPU holds a <strong>full copy</strong> of the model</li>
+    <li>Each GPU processes a <strong>different minibatch</strong> of data</li>
+    <li>Each GPU computes <strong>local gradients</strong> via backpropagation</li>
+    <li>All GPUs <strong>synchronize</strong>: average their gradients</li>
+    <li>Each GPU updates its local model with the averaged gradient</li>
+    <li>Repeat from step 2</li>
+  </ol>
+  <div class="highlight-box">
+    Step 4 is the bottleneck. The <strong>communication algorithm</strong> used for this step determines whether training can scale.
+  </div>
+</section>
+
+<!-- ===== PART 2: HARDWARE ===== -->
+<section>
+  <h2>2. Hardware: Ethernet vs NVLink</h2>
+  <div class="two-col">
+    <div>
+      <h3 style="color:#e74c3c;">Standard Ethernet</h3>
+      <p class="small" style="color:#ccc;">GPU &rarr; PCIe &rarr; CPU &rarr; NIC &rarr; Switch &rarr; NIC &rarr; CPU &rarr; PCIe &rarr; GPU</p>
+      <ul>
+        <li>CPU manages every packet</li>
+        <li>TCP/IP stack overhead (~10&micro;s)</li>
+        <li>~12.5 GB/s (100 Gbps)</li>
+        <li>Used in Spark/Hadoop clusters</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="color:#2ecc71;">NVLink / InfiniBand</h3>
+      <p class="small" style="color:#ccc;">GPU &rarr; NVLink &rarr; GPU (direct!)</p>
+      <ul>
+        <li><strong>RDMA</strong>: GPU writes directly to remote GPU VRAM</li>
+        <li>No CPU interrupts, no kernel switches</li>
+        <li>NVLink 4.0: <strong>900 GB/s</strong></li>
+        <li>Used in NVIDIA DGX / AI clusters</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>RDMA: Remote Direct Memory Access</h2>
+  <p>The key innovation enabling AI-scale communication:</p>
+  <table style="width:90%;">
+    <tr><th>Feature</th><th>Traditional (TCP/IP)</th><th>RDMA (InfiniBand/NVLink)</th></tr>
+    <tr><td>CPU involvement</td><td>Every packet</td><td><strong>Zero</strong> (kernel bypass)</td></tr>
+    <tr><td>Memory copies</td><td>User &rarr; kernel &rarr; NIC</td><td><strong>Zero-copy</strong> (DMA)</td></tr>
+    <tr><td>Latency</td><td>~10&ndash;100 &micro;s</td><td><strong>~1 &micro;s</strong></td></tr>
+    <tr><td>CPU utilization</td><td>High (interrupts)</td><td><strong>Near zero</strong></td></tr>
+  </table>
+  <div class="highlight-box">
+    RDMA allows one GPU to <strong>write directly into another GPU's VRAM</strong> across a network, without involving either CPU. This is why modern AI clusters use InfiniBand, not Ethernet.
+  </div>
+</section>
+
+<!-- ===== PART 3: PARAMETER SERVER ===== -->
+<section>
+  <h2>3. Parameter Server (Hub-and-Spoke)</h2>
+  <h3>The Spark-style approach to gradient aggregation</h3>
+  <ol>
+    <li>Each worker computes gradients on its local minibatch</li>
+    <li>All workers <strong>send gradients</strong> to a central parameter server</li>
+    <li>The server <strong>averages</strong> all gradients</li>
+    <li>The server <strong>broadcasts</strong> the updated model back</li>
+  </ol>
+  <div class="eq-box">
+    $$T_{PS} = \frac{M \cdot N}{B}$$
+  </div>
+  <p class="small">$M$ = model size (bytes), $N$ = number of nodes, $B$ = server NIC bandwidth</p>
+</section>
+
+<section>
+  <h2>Why Parameter Servers Don't Scale</h2>
+  <p>The server's single NIC must receive $M$ bytes from <strong>each</strong> of $N$ workers:</p>
+  <table style="width:90%;">
+    <tr><th>Model (M)</th><th>Nodes (N)</th><th>BW (B)</th><th>T<sub>PS</sub></th></tr>
+    <tr><td>100 MB (ResNet-50)</td><td>8</td><td>50 GB/s</td><td>0.016s &check;</td></tr>
+    <tr><td>5.7 GB (GPT-2)</td><td>64</td><td>50 GB/s</td><td>7.3s &cross;</td></tr>
+    <tr><td>5.7 GB (GPT-2)</td><td>1024</td><td>50 GB/s</td><td><strong>117s &cross;</strong></td></tr>
+  </table>
+  <div class="warning-box">
+    <strong>Linear scaling with N.</strong> The server NIC is a hard physical bottleneck &mdash; adding more workers makes it <em>worse</em>.
+  </div>
+</section>
+
+<!-- ===== PART 4: RING-ALLREDUCE ===== -->
+<section>
+  <h2>4. Ring-AllReduce</h2>
+  <h3>Key Idea: Eliminate the Central Bottleneck</h3>
+  <p>Arrange $N$ nodes in a <strong>logical ring</strong>. Every node sends and receives simultaneously.</p>
+  <p>Divide the gradient vector into $N$ equal chunks. The algorithm has two phases:</p>
+  <div class="two-col">
+    <div>
+      <h3 style="color:#f39c12;">Phase 1: Scatter-Reduce</h3>
+      <ul>
+        <li>$N-1$ steps around the ring</li>
+        <li>Each node sends $\frac{M}{N}$ per step</li>
+        <li>Received chunks are <strong>summed</strong></li>
+        <li>Result: each node owns one fully-reduced chunk</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="color:#3498db;">Phase 2: All-Gather</h3>
+      <ul>
+        <li>$N-1$ more steps around the ring</li>
+        <li>Completed chunks are forwarded</li>
+        <li>No computation, just copy</li>
+        <li>Result: every node has the full result</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Ring-AllReduce: The Math</h2>
+  <p>Total data per node per phase: $(N-1) \times \frac{M}{N}$ bytes</p>
+  <div class="eq-box">
+    $$T_{Ring} = 2 \times \frac{M(N-1)}{N \cdot B}$$
+  </div>
+  <p>Taking the limit as $N \to \infty$:</p>
+  <div class="eq-box">
+    $$\lim_{N \to \infty} T_{Ring} = \frac{2M}{B} \quad \text{(constant!)}$$
+  </div>
+  <div class="highlight-box">
+    Adding more nodes does <strong>NOT</strong> increase communication time. This is why NVIDIA can train on 30,000+ GPUs.
+  </div>
+</section>
+
+<section>
+  <h2>Bandwidth Optimality</h2>
+  <p>Ring-AllReduce is <strong>bandwidth-optimal</strong>: no algorithm can use less bandwidth.</p>
+  <table style="width:90%;">
+    <tr><th>Metric</th><th>Parameter Server</th><th>Ring-AllReduce</th></tr>
+    <tr><td>Time complexity</td><td>$\mathcal{O}(MN/B)$</td><td>$\mathcal{O}(M/B)$</td></tr>
+    <tr><td>BW utilization</td><td>$1/N \to 0\%$</td><td>$(N{-}1)/N \to 100\%$</td></tr>
+    <tr><td>Server bottleneck</td><td>Yes (single NIC)</td><td>None (symmetric)</td></tr>
+    <tr><td>Scales with N?</td><td style="color:#e74c3c;">No (linear slowdown)</td><td style="color:#2ecc71;">Yes (constant time)</td></tr>
+  </table>
+  <div class="highlight-box">
+    Every node must send at least $M$ bytes (scatter) and receive $M$ bytes (gather) = $2M$ total. Ring-AllReduce approaches this lower bound as $N$ grows.
+  </div>
+</section>
+
+<!-- ===== PART 5: EXAMPLE ===== -->
+<section>
+  <h2>Numerical Example: GPT-2 at Scale</h2>
+  <p>Model: 5.7 GB &nbsp;|&nbsp; Bandwidth: 50 GB/s per node</p>
+  <table style="width:90%;">
+    <tr><th>Nodes (N)</th><th>T<sub>PS</sub></th><th>T<sub>Ring</sub></th><th>Speedup</th></tr>
+    <tr><td>8</td><td>0.91s</td><td>0.20s</td><td>4.6&times;</td></tr>
+    <tr><td>64</td><td>7.30s</td><td>0.22s</td><td>33&times;</td></tr>
+    <tr><td>256</td><td>29.2s</td><td>0.23s</td><td>127&times;</td></tr>
+    <tr><td>1024</td><td>117s</td><td>0.23s</td><td>509&times;</td></tr>
+    <tr><td>8192</td><td>934s</td><td>0.23s</td><td>4,061&times;</td></tr>
+  </table>
+  <div class="highlight-box">
+    Ring-AllReduce time barely changes from 8 to 8,192 nodes, while the Parameter Server becomes completely unusable.
+  </div>
+</section>
+
+<!-- ===== MODERN TOPOLOGIES ===== -->
+<section>
+  <h2>Beyond Simple Rings: Modern Topologies</h2>
+  <p>Real GPU clusters use more advanced collective algorithms:</p>
+  <table style="width:90%;">
+    <tr><th>Topology</th><th>Used In</th><th>Advantage</th></tr>
+    <tr><td><strong>2D/3D Torus</strong></td><td>Google TPU Pods</td><td>Multiple simultaneous rings</td></tr>
+    <tr><td><strong>Fat Tree</strong></td><td>InfiniBand clusters</td><td>Full bisection bandwidth</td></tr>
+    <tr><td><strong>NVSwitch Mesh</strong></td><td>NVIDIA DGX (intra-node)</td><td>All-to-all at NVLink speed</td></tr>
+    <tr><td><strong>Rail-Optimized</strong></td><td>NVIDIA SuperPODs</td><td>Minimizes inter-rail hops</td></tr>
+  </table>
+  <div class="highlight-box">
+    All of these are generalizations of Ring-AllReduce. The core mathematical principle &mdash; <strong>every node sends/receives simultaneously at full bandwidth</strong> &mdash; remains the same.
+  </div>
+</section>
+
+<!-- ===== RECAP ===== -->
+<section>
+  <h2>Key Takeaways</h2>
+  <ol>
+    <li><strong>Gradient synchronization</strong> is the bottleneck in distributed training, not computation</li>
+    <li><strong>Parameter Servers</strong> scale as $\mathcal{O}(MN/B)$ &mdash; unusable beyond ~8 nodes for large models</li>
+    <li><strong>Ring-AllReduce</strong> scales as $\mathcal{O}(M/B)$ &mdash; constant time regardless of cluster size</li>
+    <li><strong>RDMA/NVLink</strong> eliminate CPU involvement, enabling 900+ GB/s GPU-to-GPU transfer</li>
+    <li>Modern clusters use <strong>torus/mesh topologies</strong> that generalize the ring principle</li>
+  </ol>
+</section>
+
+<!-- ===== LAB ===== -->
+<section class="center-slide">
+  <h2>&#x1F9EA; Hands-On Lab</h2>
+  <p>Open <code>notebooks/Lecture_03_Distributed_Paradigms.ipynb</code></p>
+  <ol style="text-align:left; max-width:80%; margin:auto;">
+    <li>Use the <strong>Interactive Simulator</strong> to compare PS vs Ring scaling</li>
+    <li>Set <strong>N = 30,000</strong> and observe bandwidth saturation</li>
+    <li>Try <strong>M = 100 GB</strong> (LLM-scale) &mdash; is Ring still practical?</li>
+    <li>Increase <strong>BW to 900 GB/s</strong> (NVLink) &mdash; what changes?</li>
+  </ol>
+</section>
+
+</div><!-- /.slides -->
+</div><!-- /.reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/math/math.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  slideNumber: true,
+  transition: 'slide',
+  plugins: [ RevealHighlight, RevealMath.KaTeX ]
+});
+</script>
+</body>
+</html>
