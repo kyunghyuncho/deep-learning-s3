@@ -35,7 +35,7 @@ $$y = \mathcal{F}(x, \{W_i\}) + x$$
 When running back-propagation, the derivative guarantees a healthy gradient signal is sent back to earlier layers linearly:
 $$\frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} \left( \frac{\partial \mathcal{F}}{\partial x} + 1 \right)$$
 
-This architecture is optimized against Categorical Cross-Entropy loss mapping the true probability $y_c$ and predicted probability $\hat{y}_c$:
+This architecture is optimized against Categorical Cross-Entropy loss mapping the true probability $y_c$ and predicted probability $$\hat{y}_c$$:
 $$\mathcal{L} = -\sum_{c=1}^{C} y_c \log(\hat{y}_c)$$
 
 ### Lecture 3: Distributed Paradigms
