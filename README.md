@@ -1,6 +1,6 @@
 # Bridging Big Data and Distributed AI Ingestion
 
-This repository serves as the unified lecture material and interactive environment for the Big Data (CSCI-GA.2437) module on distributed data ingestion and streaming architectures.
+This repository serves as the unified lecture material and interactive environment for distributed data ingestion and streaming architectures.
 
 ## Lecture Notes & Theoretical Foundations
 
