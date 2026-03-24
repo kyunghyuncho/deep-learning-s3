@@ -11,46 +11,48 @@
   :root {
     --r-heading-color: #58a6ff;
     --r-link-color: #79c0ff;
-    --r-main-font-size: 32px;
+    --r-main-font-size: 28px;
   }
-  .reveal h1, .reveal h2 { color: #58a6ff; }
-  .reveal h3 { color: #8b949e; }
+  .reveal h1, .reveal h2 { color: #58a6ff; margin-bottom: 0.3em; }
+  .reveal h3 { color: #8b949e; margin-bottom: 0.2em; }
+  .reveal p { margin: 0.3em 0; }
   .reveal .slides section { text-align: left; }
   .reveal .slides section.center-slide { text-align: center; }
   .reveal .highlight-box {
     background: rgba(88,166,255,0.1);
     border-left: 4px solid #58a6ff;
-    padding: 16px 20px;
-    margin: 16px 0;
+    padding: 10px 16px;
+    margin: 10px 0;
     border-radius: 4px;
-    font-size: 0.85em;
+    font-size: 0.78em;
   }
   .reveal .warning-box {
     background: rgba(210,153,34,0.12);
     border-left: 4px solid #d29922;
-    padding: 16px 20px;
-    margin: 16px 0;
+    padding: 10px 16px;
+    margin: 10px 0;
     border-radius: 4px;
-    font-size: 0.85em;
+    font-size: 0.78em;
   }
   .reveal .eq-box {
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.15);
     border-radius: 8px;
-    padding: 20px 28px;
-    margin: 20px auto;
+    padding: 12px 20px;
+    margin: 12px auto;
     text-align: center;
     max-width: 85%;
   }
-  .reveal table { font-size: 0.7em; margin: 12px auto; }
+  .reveal table { font-size: 0.65em; margin: 8px auto; }
   .reveal table th { background: rgba(88,166,255,0.15); }
-  .reveal table td, .reveal table th { padding: 8px 16px; border: 1px solid rgba(255,255,255,0.15); }
+  .reveal table td, .reveal table th { padding: 6px 12px; border: 1px solid rgba(255,255,255,0.15); }
   .reveal code { color: #79c0ff; }
-  .reveal ul { font-size: 0.85em; }
+  .reveal ul, .reveal ol { font-size: 0.8em; }
   .reveal .subtitle { color: #8b949e; font-size: 0.7em; }
-  .reveal .two-col { display: flex; gap: 40px; }
+  .reveal .two-col { display: flex; gap: 30px; }
   .reveal .two-col > div { flex: 1; }
-  .reveal .small { font-size: 0.65em; color: #8b949e; }
+  .reveal .small { font-size: 0.6em; color: #8b949e; }
+  .reveal pre { margin: 8px 0; font-size: 0.48em; }
 </style>
 </head>
 <body>
@@ -208,13 +210,9 @@ dataset = wds.WebDataset(url, shardshuffle=True)  # Inter-shard shuffle
 <section>
   <h2>The Residual Solution</h2>
   <h3>He et al., 2015 — "Deep Residual Learning"</h3>
-  <p>Instead of learning a direct mapping $H(x)$, learn a <strong>perturbation</strong> added to identity:</p>
+  <p>Instead of learning $H(x)$ directly, learn a <strong>perturbation</strong> $\mathcal{F}(x)$ added to identity:</p>
   <div class="eq-box">
-    $$y = \mathcal{F}(x, \{W_i\}) + x$$
-  </div>
-  <p>The derivative via chain rule:</p>
-  <div class="eq-box">
-    $$\frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} \left( \frac{\partial \mathcal{F}}{\partial x} + \mathbf{1} \right)$$
+    $$y = \mathcal{F}(x, \{W_i\}) + x \qquad \Longrightarrow \qquad \frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} \left( \frac{\partial \mathcal{F}}{\partial x} + \mathbf{1} \right)$$
   </div>
   <div class="highlight-box">
     The <strong>+1 term</strong> from the identity shortcut guarantees gradients always have a direct highway back through the network, regardless of what $\mathcal{F}$ learns. This enables networks with 1,000+ layers.
@@ -240,16 +238,12 @@ dataset = wds.WebDataset(url, shardshuffle=True)  # Inter-shard shuffle
 <!-- ===== PART 4: TRAINING ===== -->
 <section>
   <h2>4. Categorical Cross-Entropy Loss</h2>
-  <p>The model outputs <strong>logits</strong> $z \in \mathbb{R}^{C}$. Softmax converts to probabilities:</p>
+  <p>The model outputs <strong>logits</strong> $z \in \mathbb{R}^{C}$. Softmax → probabilities → loss:</p>
   <div class="eq-box">
-    $$\hat{y}_c = \frac{e^{z_c}}{\sum_{j=1}^{C} e^{z_j}}$$
-  </div>
-  <p>Cross-entropy measures the "surprise" of predicted vs. true distribution:</p>
-  <div class="eq-box">
-    $$\mathcal{L} = -\sum_{c=1}^{C} y_c \log(\hat{y}_c) = -\log(\hat{y}_{true})$$
+    $$\hat{y}_c = \frac{e^{z_c}}{\sum_{j} e^{z_j}} \qquad \Longrightarrow \qquad \mathcal{L} = -\log(\hat{y}_{true})$$
   </div>
   <div class="highlight-box">
-    PyTorch's <code>F.cross_entropy</code> uses the <strong>log-sum-exp trick</strong> for numerical stability: $\mathcal{L} = -z_{true} + \log\left(\sum_j e^{z_j}\right)$. Never compute softmax + log separately!
+    PyTorch's <code>F.cross_entropy</code> uses the <strong>log-sum-exp trick</strong> for numerical stability: $\mathcal{L} = -z_{true} + \log\!\left(\sum_j e^{z_j}\right)$. Never compute softmax + log separately!
   </div>
 </section>
 
